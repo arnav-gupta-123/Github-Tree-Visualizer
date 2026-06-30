@@ -149,6 +149,7 @@ activemq-data/
 
 # Environments
 .env
+.env*.local
 .envrc
 .venv
 env/
@@ -219,3 +220,4 @@ __marimo__/
 
 #next.js
 /node_modules/
+.vercel

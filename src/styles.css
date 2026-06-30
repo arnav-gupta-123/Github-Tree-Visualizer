@@ -278,10 +278,12 @@ body.is-resizing-sidebar {
   z-index: 4;
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
 }
 
-.graph-toolbar button {
+.graph-toolbar button,
+.branch-limit-control {
   min-width: 40px;
   padding: 0 12px;
   color: #243244;
@@ -290,10 +292,31 @@ body.is-resizing-sidebar {
   box-shadow: 0 8px 24px rgba(24, 36, 49, 0.12);
 }
 
+.branch-limit-control {
+  display: grid;
+  grid-template-columns: auto minmax(110px, 170px);
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  border-radius: 8px;
+  font-size: 0.84rem;
+  font-weight: 750;
+}
+
+.branch-limit-control span {
+  white-space: nowrap;
+}
+
+.branch-limit-control input {
+  width: 100%;
+  accent-color: #2d6cdf;
+}
+
 .graph-link {
   opacity: 0.54;
   transition: opacity 160ms ease;
   cursor: pointer;
+  pointer-events: stroke;
 }
 
 .graph-link:hover,
@@ -671,5 +694,10 @@ body.is-resizing-sidebar {
   .graph-toolbar {
     right: 12px;
     left: 12px;
+  }
+
+  .branch-limit-control {
+    grid-template-columns: 1fr;
+    width: 100%;
   }
 }

@@ -37,4 +37,13 @@ export default [
       },
     },
   },
+  {
+    files: ['api/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
 ];

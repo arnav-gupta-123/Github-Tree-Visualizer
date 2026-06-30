@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Octokit } from '@octokit/rest';
 import * as d3 from 'd3';
 import {
   AlertTriangle,
@@ -16,40 +15,12 @@ import {
 } from 'lucide-react';
 import './styles.css';
 
-const COMMIT_LIMIT_PER_BRANCH = 22;
-const BRANCH_LIMIT = 12;
+const DEFAULT_BRANCH_LIMIT = 12;
+const CLIENT_MAX_BRANCH_LIMIT = 50;
 const LANE_WIDTH = 112;
 const ROW_HEIGHT = 72;
 const GRAPH_LEFT_PADDING = 130;
 const GRAPH_TOP_PADDING = 92;
-const PALETTE = [
-  '#1f77b4',
-  '#d62728',
-  '#2ca02c',
-  '#9467bd',
-  '#ff7f0e',
-  '#17becf',
-  '#8c564b',
-  '#e377c2',
-  '#bcbd22',
-  '#7f7f7f',
-  '#2f4b7c',
-  '#a05195',
-];
-
-const octokit = new Octokit({
-  auth: import.meta.env.VITE_GITHUB_TOKEN || undefined,
-});
-
-function parseGitHubRepoUrl(value) {
-  const trimmed = value.trim().replace(/\.git$/, '');
-  const match = trimmed.match(/github\.com[:/](?<owner>[^/\s]+)\/(?<repo>[^/#?\s]+)/i);
-  if (!match?.groups) return null;
-  return {
-    owner: match.groups.owner,
-    repo: match.groups.repo,
-  };
-}
 
 function shortSha(sha = '') {
   return sha.slice(0, 7);
@@ -78,10 +49,6 @@ function getBranchColor(branch) {
   return mixWithGray(branch.baseColor, dullness);
 }
 
-function makeEdgeKey(source, target, branchName) {
-  return `${source}->${target}:${branchName}`;
-}
-
 function getContributorName(commit) {
   return (
     commit.author?.login ||
@@ -100,62 +67,6 @@ function summarizeBranch(branch) {
   return [...contributors.entries()]
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count);
-}
-
-function buildGraph(branches, defaultBranchName) {
-  const nodeMap = new Map();
-  const edgeMap = new Map();
-
-  branches.forEach((branch) => {
-    branch.commits.forEach((commit, index) => {
-      const existing = nodeMap.get(commit.sha);
-      const branchNames = new Set(existing?.branches || []);
-      branchNames.add(branch.name);
-      const primaryBranch = existing?.primaryBranch || branch.name;
-
-      nodeMap.set(commit.sha, {
-        ...existing,
-        id: commit.sha,
-        sha: commit.sha,
-        branches: [...branchNames],
-        primaryBranch,
-        message: commit.commit?.message?.split('\n')[0] || 'No commit message',
-        author: getContributorName(commit),
-        avatar: commit.author?.avatar_url,
-        date: commit.commit?.author?.date || commit.commit?.committer?.date,
-        url: commit.html_url,
-        branchDepth: Math.min(existing?.branchDepth ?? Number.POSITIVE_INFINITY, index),
-        parents: commit.parents?.map((parent) => parent.sha) || [],
-      });
-
-      commit.parents?.forEach((parent) => {
-        const key = makeEdgeKey(parent.sha, commit.sha, branch.name);
-        if (!edgeMap.has(key)) {
-          edgeMap.set(key, {
-            id: key,
-            source: parent.sha,
-            target: commit.sha,
-            branch: branch.name,
-            defaultBranch: branch.name === defaultBranchName,
-          });
-        }
-      });
-    });
-  });
-
-  const nodes = [...nodeMap.values()]
-    .map((node) => ({
-      ...node,
-      branchScore: node.branches.includes(defaultBranchName) ? 0 : node.branchDepth + 1,
-    }))
-    .sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
-
-  const validNodeIds = new Set(nodes.map((node) => node.id));
-  const links = [...edgeMap.values()].filter(
-    (link) => validNodeIds.has(link.source) && validNodeIds.has(link.target),
-  );
-
-  return { nodes, links };
 }
 
 function createLaneLayout(graph, branches) {
@@ -192,84 +103,70 @@ function createLaneLayout(graph, branches) {
   return { nodes, links };
 }
 
-function orthogonalPath(edge) {
-  const { source, target } = edge;
-  if (Math.abs(source.x - target.x) < 2) {
-    return `M${source.x},${source.y}L${target.x},${target.y}`;
-  }
-
-  const turnY = target.y;
-  return `M${source.x},${source.y}L${source.x},${turnY}L${target.x},${turnY}`;
+function hashString(value) {
+  return [...value].reduce((hash, character) => {
+    return (hash * 31 + character.charCodeAt(0)) % 997;
+  }, 7);
 }
 
-async function loadRepository(repoUrl) {
-  const parsed = parseGitHubRepoUrl(repoUrl);
-  if (!parsed) {
-    throw new Error('Paste a valid GitHub repository URL, such as https://github.com/facebook/react.');
+function organicBranchPath(edge) {
+  const { source, target } = edge;
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const wobble = (hashString(edge.branch) % 15) - 7;
+
+  if (Math.abs(dx) < 2) {
+    const midY = source.y + dy / 2;
+    return `M${source.x},${source.y}C${source.x + wobble},${midY} ${target.x - wobble},${midY} ${target.x},${target.y}`;
   }
 
-  const { owner, repo } = parsed;
-  const repository = await octokit.rest.repos.get({ owner, repo });
-  const defaultBranchName = repository.data.default_branch;
+  const sign = Math.sign(dx);
+  const verticalSign = Math.sign(dy) || -1;
+  const radius = Math.min(36, Math.abs(dx) * 0.4, Math.max(18, Math.abs(dy) * 0.34));
+  const leadY = target.y - verticalSign * radius;
+  const exitX = source.x + sign * radius;
+  const enterX = target.x - sign * radius;
 
-  const branchResponse = await octokit.rest.repos.listBranches({
-    owner,
-    repo,
-    per_page: BRANCH_LIMIT,
+  return [
+    `M${source.x},${source.y}`,
+    `C${source.x + wobble},${source.y + dy * 0.36} ${source.x + wobble},${leadY} ${source.x},${leadY}`,
+    `Q${source.x},${target.y} ${exitX},${target.y}`,
+    `C${source.x + dx * 0.38},${target.y + wobble * 0.18} ${source.x + dx * 0.62},${target.y - wobble * 0.18} ${enterX},${target.y}`,
+    `Q${target.x},${target.y} ${target.x},${target.y}`,
+  ].join('');
+}
+
+async function loadRepository(repoUrl, branchLimit = DEFAULT_BRANCH_LIMIT) {
+  const params = new URLSearchParams({
+    action: 'repository',
+    repoUrl,
+    branchLimit: String(branchLimit),
   });
+  const response = await fetch(`/api/github?${params.toString()}`);
+  const data = await response.json();
 
-  const sortedBranches = branchResponse.data
-    .sort((a, b) => Number(b.name === defaultBranchName) - Number(a.name === defaultBranchName))
-    .slice(0, BRANCH_LIMIT);
+  if (!response.ok) {
+    throw new Error(data.error || 'Could not load that repository.');
+  }
 
-  const branches = await Promise.all(
-    sortedBranches.map(async (branch, index) => {
-      const [commitsResponse, compareResponse] = await Promise.all([
-        octokit.rest.repos.listCommits({
-          owner,
-          repo,
-          sha: branch.name,
-          per_page: COMMIT_LIMIT_PER_BRANCH,
-        }),
-        branch.name === defaultBranchName
-          ? Promise.resolve({ data: { ahead_by: 0, behind_by: 0, files: [] } })
-          : octokit.rest.repos.compareCommitsWithBasehead({
-              owner,
-              repo,
-              basehead: `${defaultBranchName}...${branch.name}`,
-            }).catch(() => ({ data: { ahead_by: 0, behind_by: 0, files: [] } })),
-      ]);
-
-      return {
-        name: branch.name,
-        sha: branch.commit.sha,
-        protected: branch.protected,
-        baseColor: PALETTE[index % PALETTE.length],
-        commits: commitsResponse.data,
-        aheadBy: compareResponse.data.ahead_by || 0,
-        behindBy: compareResponse.data.behind_by || 0,
-        changedFiles: compareResponse.data.files || [],
-      };
-    }),
-  );
-
-  return {
-    owner,
-    repo,
-    repository: repository.data,
-    defaultBranchName,
-    branches,
-    graph: buildGraph(branches, defaultBranchName),
-  };
+  return data;
 }
 
 async function loadCommitDetails(repoData, sha) {
-  const response = await octokit.rest.repos.getCommit({
+  const params = new URLSearchParams({
+    action: 'commit',
     owner: repoData.owner,
     repo: repoData.repo,
-    ref: sha,
+    sha,
   });
-  return response.data;
+  const response = await fetch(`/api/github?${params.toString()}`);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error || 'Could not load commit details.');
+  }
+
+  return data;
 }
 
 function predictConflicts(firstBranch, secondBranch) {
@@ -344,7 +241,17 @@ function Header({ repoUrl, setRepoUrl, onLoad, loading, error, repoData }) {
   );
 }
 
-function Toolbar({ onZoomIn, onZoomOut, onReset, selectedBranches, onClearBranches }) {
+function Toolbar({
+  onZoomIn,
+  onZoomOut,
+  onReset,
+  selectedBranches,
+  onClearBranches,
+  branchLimit,
+  maxBranchLimit,
+  onBranchLimitChange,
+  loading,
+}) {
   return (
     <div className="graph-toolbar" aria-label="Graph controls">
       <button type="button" onClick={onZoomIn} title="Zoom in" aria-label="Zoom in">
@@ -362,11 +269,23 @@ function Toolbar({ onZoomIn, onZoomOut, onReset, selectedBranches, onClearBranch
           Clear Branches
         </button>
       )}
+      <label className="branch-limit-control">
+        <span>Top {branchLimit} branches</span>
+        <input
+          type="range"
+          min="2"
+          max={maxBranchLimit}
+          value={branchLimit}
+          disabled={loading}
+          onChange={(event) => onBranchLimitChange(Number(event.target.value))}
+          aria-label="Top branches by recent activity"
+        />
+      </label>
     </div>
   );
 }
 
-function BranchLegend({ branches, selectedBranches, onToggleBranch }) {
+function BranchLegend({ branches, selectedBranches, onToggleBranch, onFocusBranch }) {
   return (
     <aside className="legend-panel" aria-label="Branch legend">
       <div className="panel-kicker">Branches</div>
@@ -379,7 +298,10 @@ function BranchLegend({ branches, selectedBranches, onToggleBranch }) {
               key={branch.name}
               className={`legend-row ${selected ? 'selected' : ''}`}
               type="button"
-              onClick={() => onToggleBranch(branch.name)}
+              onClick={() => {
+                onToggleBranch(branch.name);
+                onFocusBranch(branch.name);
+              }}
             >
               <span className="branch-swatch" style={{ background: color }} />
               <span className="legend-name">{branch.name}</span>
@@ -397,6 +319,11 @@ function GraphCanvas({
   branches,
   selectedCommits,
   selectedBranches,
+  focusRequest,
+  branchLimit,
+  maxBranchLimit,
+  onBranchLimitChange,
+  loading,
   onToggleCommit,
   onToggleBranch,
   onNodeDetails,
@@ -405,6 +332,7 @@ function GraphCanvas({
   const wrapperRef = useRef(null);
   const zoomRef = useRef(null);
   const nodePositionsRef = useRef(new Map());
+  const layoutNodesRef = useRef([]);
   const branchByName = useMemo(() => new Map(branches.map((branch) => [branch.name, branch])), [branches]);
 
   const applyZoom = useCallback((factor) => {
@@ -465,7 +393,7 @@ function GraphCanvas({
       .attr('class', (edge) => `graph-link ${selectedBranches.includes(edge.branch) ? 'selected' : ''}`)
       .attr('stroke', (edge) => getBranchColor(branchByName.get(edge.branch)))
       .attr('stroke-width', (edge) => (selectedBranches.includes(edge.branch) ? 5 : 3))
-      .attr('d', orthogonalPath)
+      .attr('d', organicBranchPath)
       .attr('fill', 'none')
       .attr('stroke-linecap', 'round')
       .attr('stroke-linejoin', 'round')
@@ -477,7 +405,7 @@ function GraphCanvas({
     link.append('title').text((edge) => `Select branch ${edge.branch}`);
 
     const updateGraph = () => {
-      link.attr('d', orthogonalPath);
+      link.attr('d', organicBranchPath);
       node.attr('transform', (commit) => `translate(${commit.x},${commit.y})`);
     };
 
@@ -531,6 +459,7 @@ function GraphCanvas({
     nodes.forEach((commit) => {
       nodePositionsRef.current.set(commit.id, { x: commit.x, y: commit.y });
     });
+    layoutNodesRef.current = nodes;
     updateGraph();
 
     return () => {
@@ -547,6 +476,39 @@ function GraphCanvas({
     selectedCommits,
   ]);
 
+  useEffect(() => {
+    if (!focusRequest || !svgRef.current || !wrapperRef.current || !zoomRef.current) return;
+
+    const branchNodes = layoutNodesRef.current.filter((node) => node.branches.includes(focusRequest.name));
+    if (!branchNodes.length) return;
+
+    const bounds = branchNodes.reduce((box, node) => ({
+      minX: Math.min(box.minX, node.x),
+      maxX: Math.max(box.maxX, node.x),
+      minY: Math.min(box.minY, node.y),
+      maxY: Math.max(box.maxY, node.y),
+    }), {
+      minX: Number.POSITIVE_INFINITY,
+      maxX: Number.NEGATIVE_INFINITY,
+      minY: Number.POSITIVE_INFINITY,
+      maxY: Number.NEGATIVE_INFINITY,
+    });
+    const { width, height } = wrapperRef.current.getBoundingClientRect();
+    const centerX = (bounds.minX + bounds.maxX) / 2;
+    const centerY = (bounds.minY + bounds.maxY) / 2;
+    const spanX = Math.max(bounds.maxX - bounds.minX, LANE_WIDTH);
+    const spanY = Math.max(bounds.maxY - bounds.minY, ROW_HEIGHT * 4);
+    const scale = clamp(Math.min(width / (spanX + 260), height / (spanY + 180), 1.35), 0.55, 1.35);
+    const transform = d3.zoomIdentity
+      .translate(width / 2 - centerX * scale, height / 2 - centerY * scale)
+      .scale(scale);
+
+    d3.select(svgRef.current)
+      .transition()
+      .duration(420)
+      .call(zoomRef.current.transform, transform);
+  }, [focusRequest]);
+
   return (
     <section className="graph-section" ref={wrapperRef}>
       <Toolbar
@@ -555,6 +517,10 @@ function GraphCanvas({
         onReset={resetZoom}
         selectedBranches={selectedBranches}
         onClearBranches={() => selectedBranches.forEach((name) => onToggleBranch(name))}
+        branchLimit={branchLimit}
+        maxBranchLimit={maxBranchLimit}
+        onBranchLimitChange={onBranchLimitChange}
+        loading={loading}
       />
       <svg ref={svgRef} className="graph-svg" role="img" aria-label="Commit DAG visualization" />
     </section>
@@ -673,7 +639,7 @@ function BranchPanel({ branches, branchName }) {
         </div>
       </div>
       <section className="panel-section">
-        <h3>Contributor Heatmap</h3>
+        <h3>Top Contributors</h3>
         <ContributorHeatmap contributors={contributors} />
       </section>
       <section className="panel-section">
@@ -788,6 +754,9 @@ function App() {
   const [panelMode, setPanelMode] = useState(null);
   const [branchPanelWidth, setBranchPanelWidth] = useState(280);
   const [isResizingBranches, setIsResizingBranches] = useState(false);
+  const [branchLimit, setBranchLimit] = useState(DEFAULT_BRANCH_LIMIT);
+  const [focusRequest, setFocusRequest] = useState(null);
+  const branchLimitTimerRef = useRef(null);
 
   useEffect(() => {
     if (!isResizingBranches) return undefined;
@@ -810,26 +779,53 @@ function App() {
     };
   }, [isResizingBranches]);
 
-  const handleLoad = useCallback(async (event) => {
-    event?.preventDefault();
+  useEffect(() => {
+    return () => {
+      window.clearTimeout(branchLimitTimerRef.current);
+    };
+  }, []);
+
+  const refreshRepository = useCallback(async (nextBranchLimit, resetBeforeLoad = false) => {
     setLoading(true);
     setError('');
-    setRepoData(null);
+    if (resetBeforeLoad) {
+      setRepoData(null);
+    }
     setSelectedCommits([]);
     setSelectedBranches([]);
     setSelectedCommit(null);
     setCommitDetails(null);
     setPanelMode(null);
+    setFocusRequest(null);
 
     try {
-      const data = await loadRepository(repoUrl);
+      const data = await loadRepository(repoUrl, nextBranchLimit);
       setRepoData(data);
+      setBranchLimit(data.branchLimit || nextBranchLimit);
     } catch (loadError) {
       setError(loadError.message || 'Could not load that repository.');
     } finally {
       setLoading(false);
     }
   }, [repoUrl]);
+
+  const handleLoad = useCallback(async (event) => {
+    event?.preventDefault();
+    window.clearTimeout(branchLimitTimerRef.current);
+    await refreshRepository(branchLimit, true);
+  }, [branchLimit, refreshRepository]);
+
+  const handleBranchLimitChange = useCallback((nextLimit) => {
+    const next = clamp(nextLimit, 2, repoData?.maxBranchLimit || CLIENT_MAX_BRANCH_LIMIT);
+    setBranchLimit(next);
+    window.clearTimeout(branchLimitTimerRef.current);
+
+    if (!repoData) return;
+
+    branchLimitTimerRef.current = window.setTimeout(() => {
+      refreshRepository(next, false);
+    }, 450);
+  }, [refreshRepository, repoData]);
 
   const handleToggleCommit = useCallback((sha) => {
     setSelectedCommits((current) => (
@@ -845,6 +841,10 @@ function App() {
       setPanelMode(next.length === 2 ? 'merge' : next.length === 1 ? 'branch' : null);
       return next;
     });
+  }, []);
+
+  const handleFocusBranch = useCallback((branchName) => {
+    setFocusRequest({ name: branchName, requestedAt: Date.now() });
   }, []);
 
   const handleNodeDetails = useCallback((commit) => {
@@ -865,6 +865,10 @@ function App() {
     setCommitDetails(null);
   }, []);
 
+  const maxBranchLimit = repoData?.availableBranchCount
+    ? clamp(repoData.availableBranchCount, 2, repoData.maxBranchLimit || CLIENT_MAX_BRANCH_LIMIT)
+    : CLIENT_MAX_BRANCH_LIMIT;
+
   return (
     <div className="app-shell">
       <Header
@@ -884,6 +888,7 @@ function App() {
             branches={repoData.branches}
             selectedBranches={selectedBranches}
             onToggleBranch={handleToggleBranch}
+            onFocusBranch={handleFocusBranch}
           />
           <button
             className="sidebar-resizer"
@@ -904,6 +909,11 @@ function App() {
             branches={repoData.branches}
             selectedCommits={selectedCommits}
             selectedBranches={selectedBranches}
+            focusRequest={focusRequest}
+            branchLimit={branchLimit}
+            maxBranchLimit={maxBranchLimit}
+            onBranchLimitChange={handleBranchLimitChange}
+            loading={loading}
             onToggleCommit={handleToggleCommit}
             onToggleBranch={handleToggleBranch}
             onNodeDetails={handleNodeDetails}
